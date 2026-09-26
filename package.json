@@ -1,0 +1,16 @@
+{
+  "name": "learning-ai",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "format:md": "prettier --write \"**/*.md\"",
+    "format:md:check": "prettier --check \"**/*.md\"",
+    "lint:md": "markdownlint \"**/*.md\" --ignore node_modules",
+    "lint:md:fix": "markdownlint \"**/*.md\" --ignore node_modules --fix",
+    "md": "npm run format:md && npm run lint:md:fix"
+  },
+  "devDependencies": {
+    "prettier": "^3.2.5",
+    "markdownlint-cli": "^0.39.0"
+  }
+}
