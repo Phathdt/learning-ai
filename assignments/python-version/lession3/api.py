@@ -86,10 +86,16 @@ async def run_agent_endpoint(request: AgentRequest):
         # Create agent graph
         graph = create_agent_graph()
 
-        # Initial state
+        # Initial state - phải khớp với AgentState
         initial_state = {
+            "task": request.task,
             "messages": [HumanMessage(content=request.task)],
-            "turn_count": 0
+            "tool_results": [],
+            "plan": None,
+            "iteration": 0,
+            "status": "running",
+            "verification_passed": False,
+            "error_message": None
         }
 
         # Run graph
@@ -100,8 +106,8 @@ async def run_agent_endpoint(request: AgentRequest):
 
         return AgentResponse(
             result=result,
-            turns=final_state.get("turn_count", 0),
-            status="completed"
+            turns=final_state.get("iteration", 0),
+            status=final_state.get("status", "completed")
         )
 
     except Exception as e:
@@ -124,39 +130,46 @@ async def stream_agent_endpoint(request: AgentRequest):
             # Create agent graph
             graph = create_agent_graph()
 
-            # Initial state
+            # Initial state - phải khớp với AgentState
             initial_state = {
+                "task": request.task,
                 "messages": [HumanMessage(content=request.task)],
-                "turn_count": 0
+                "tool_results": [],
+                "plan": None,
+                "iteration": 0,
+                "status": "running",
+                "verification_passed": False,
+                "error_message": None
             }
 
             # Stream events
             yield f"data: {{'event': 'start', 'task': '{request.task}'}}\n\n"
 
             # Run graph with streaming
-            for state in graph.stream(initial_state):
-                turn = state.get("turn_count", 0)
+            for chunk in graph.stream(initial_state, stream_mode="updates"):
+                for node_name, node_update in chunk.items():
+                    iteration = node_update.get("iteration", 0)
 
-                # Send turn update
-                yield f"data: {{'event': 'turn', 'turn': {turn}}}\n\n"
+                    # Send node update
+                    yield f"data: {{'event': 'node', 'name': '{node_name}', 'iteration': {iteration}}}\n\n"
 
-                # Check for messages
-                if "messages" in state:
-                    last_message = state["messages"][-1]
+                    # Check for messages
+                    if "messages" in node_update:
+                        messages = node_update["messages"]
+                        for message in messages:
+                            if isinstance(message, AIMessage):
+                                if message.content:
+                                    content = str(message.content).replace("'", "\\'")[:200]
+                                    yield f"data: {{'event': 'message', 'content': '{content}'}}\n\n"
 
-                    if isinstance(last_message, AIMessage):
-                        if last_message.content:
-                            content = last_message.content.replace("'", "\\'")
-                            yield f"data: {{'event': 'message', 'content': '{content}'}}\n\n"
+                                if hasattr(message, "tool_calls") and message.tool_calls:
+                                    for tool_call in message.tool_calls:
+                                        tool_name = tool_call.get("name", "unknown")
+                                        yield f"data: {{'event': 'tool_call', 'tool': '{tool_name}'}}\n\n"
 
-                        if hasattr(last_message, "tool_calls") and last_message.tool_calls:
-                            for tool_call in last_message.tool_calls:
-                                tool_name = tool_call.get("name", "unknown")
-                                yield f"data: {{'event': 'tool_call', 'tool': '{tool_name}'}}\n\n"
-
-                    elif isinstance(last_message, ToolMessage):
-                        result = last_message.content[:100].replace("'", "\\'")
-                        yield f"data: {{'event': 'tool_result', 'result': '{result}...'}}\n\n"
+                            elif isinstance(message, ToolMessage):
+                                result = str(message.content)[:100].replace("'", "\\'")
+                                yield f"data: {{'event': 'tool_result', 'result': '{result}...'}}\n\n"
 
             yield f"data: {{'event': 'done'}}\n\n"
 
