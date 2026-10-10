@@ -15,7 +15,7 @@ from langchain_core.messages import HumanMessage, ToolMessage
 from llm_setup import create_llm, get_llm_with_tools
 
 # Import tools
-from tools import run_shell_tool
+from tools import run_shell_tool, query_db, list_tables
 
 
 # LangGraph State
@@ -88,7 +88,7 @@ def agent_node(state: AgentState) -> dict:
         )
         messages = [messages[0], plan_message]
 
-    llm_with_tools = get_llm_with_tools([run_shell_tool])
+    llm_with_tools = get_llm_with_tools([run_shell_tool, query_db, list_tables])
     response = invoke_llm_with_logging(llm_with_tools, messages, "Agent")
 
     return {"messages": [response], "iteration": iteration + 1, "status": "running"}
@@ -111,6 +111,10 @@ def tool_node(state: AgentState) -> dict:
             # Execute tool
             if tool_call["name"] == "run_shell_tool":
                 result = run_shell_tool(**tool_call["args"])
+            elif tool_call["name"] == "query_db":
+                result = query_db(**tool_call["args"])
+            elif tool_call["name"] == "list_tables":
+                result = list_tables(**tool_call["args"])
             else:
                 result = f"ERROR: Unknown tool {tool_call['name']}"
 
