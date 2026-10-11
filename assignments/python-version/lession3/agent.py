@@ -4,6 +4,7 @@ LangGraph Agent - Core logic với logging support
 
 import json
 import subprocess
+import time
 from typing import TypedDict, Annotated, Literal
 from operator import add
 
@@ -40,9 +41,13 @@ class AgentState(TypedDict):
     verification_passed: bool  # Kết quả verifier
     error_message: str | None  # Lỗi gần nhất, để retry có context
 
+    # === Retry tracking ===
+    retry_count: int  # Số lần retry tool hiện tại
+
 
 # Configuration
 MAX_ITERATIONS = 10
+MAX_TOOL_RETRIES = 3
 
 
 # Node functions
@@ -96,7 +101,7 @@ def agent_node(state: AgentState) -> dict:
 
 def tool_node(state: AgentState) -> dict:
     """
-    Node thực thi tools (với validation và permission check)
+    Node thực thi tools với retry và exponential backoff
     """
     messages = state["messages"]
     last_message = messages[-1]
@@ -107,33 +112,71 @@ def tool_node(state: AgentState) -> dict:
     for tool_call in last_message.tool_calls:
         print(f"  Executing: {tool_call['name']}")
 
-        try:
-            # Execute tool
-            if tool_call["name"] == "run_shell_tool":
-                result = run_shell_tool(**tool_call["args"])
-            elif tool_call["name"] == "query_db":
-                result = query_db(**tool_call["args"])
-            elif tool_call["name"] == "list_tables":
-                result = list_tables(**tool_call["args"])
-            else:
-                result = f"ERROR: Unknown tool {tool_call['name']}"
+        # Retry logic với exponential backoff
+        max_retries = MAX_TOOL_RETRIES
+        last_error = None
 
-            # Create tool message
-            tool_message = ToolMessage(content=result, tool_call_id=tool_call["id"])
-            tool_results.append(tool_message)
-            tool_outputs.append({"tool": tool_call["name"], "result": result})
+        for attempt in range(max_retries):
+            try:
+                # Execute tool
+                if tool_call["name"] == "run_shell_tool":
+                    result = run_shell_tool(**tool_call["args"])
+                elif tool_call["name"] == "query_db":
+                    result = query_db(**tool_call["args"])
+                elif tool_call["name"] == "list_tables":
+                    result = list_tables(**tool_call["args"])
+                else:
+                    result = f"ERROR: Unknown tool {tool_call['name']}"
 
-            # Log tool result
-            print_json(serialize_message(tool_message), "    Tool Result:")
+                # Success - create tool message
+                tool_message = ToolMessage(content=result, tool_call_id=tool_call["id"])
+                tool_results.append(tool_message)
+                tool_outputs.append({
+                    "tool": tool_call["name"],
+                    "result": result,
+                    "attempts": attempt + 1
+                })
 
-        except Exception as e:
-            error_msg = f"ERROR executing {tool_call['name']}: {str(e)}"
+                # Log tool result
+                if attempt > 0:
+                    print(f"    ✓ Succeeded after {attempt + 1} attempts")
+                print_json(serialize_message(tool_message), "    Tool Result:")
+
+                last_error = None
+                break  # Success, exit retry loop
+
+            except Exception as e:
+                last_error = e
+                error_type = type(e).__name__
+
+                if attempt < max_retries - 1:
+                    # Exponential backoff: 1s, 2s, 4s
+                    backoff = 2 ** attempt
+                    print(f"    ⚠ Attempt {attempt + 1}/{max_retries} failed: {error_type}: {str(e)}")
+                    print(f"    ⏳ Retrying in {backoff}s...")
+                    time.sleep(backoff)
+                else:
+                    # Final attempt failed
+                    print(f"    ✗ All {max_retries} attempts failed")
+
+        # If all retries exhausted, create error message
+        if last_error:
+            error_msg = f"ERROR executing {tool_call['name']} after {max_retries} attempts: {str(last_error)}"
             tool_message = ToolMessage(content=error_msg, tool_call_id=tool_call["id"])
             tool_results.append(tool_message)
-            tool_outputs.append({"tool": tool_call["name"], "error": str(e)})
-            print(f"    ERROR: {str(e)}")
+            tool_outputs.append({
+                "tool": tool_call["name"],
+                "error": str(last_error),
+                "attempts": max_retries
+            })
+            print(f"    ERROR: {error_msg}")
 
-    return {"messages": tool_results, "tool_results": tool_outputs, "status": "running"}
+    return {
+        "messages": tool_results,
+        "tool_results": tool_outputs,
+        "status": "running",
+        "retry_count": 0  # Reset for next tool execution
+    }
 
 
 def verifier_node(state: AgentState) -> dict:
@@ -296,6 +339,7 @@ def run_agent(task: str, verbose: bool = True) -> str:
         "status": "running",
         "verification_passed": False,
         "error_message": None,
+        "retry_count": 0,
     }
 
     final_state = graph.invoke(initial_state)
@@ -390,6 +434,7 @@ def run_agent_with_logging(task: str) -> str:
         "status": "running",
         "verification_passed": False,
         "error_message": None,
+        "retry_count": 0,
     }
 
     print(f"\n{'=' * 60}")
