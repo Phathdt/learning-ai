@@ -171,7 +171,59 @@ lession3/
 └── README.md          # Documentation
 ```
 
-### Flow
+### Agent Flow
+
+**LangGraph State Machine:**
+
+```mermaid
+graph TD
+    START([START]) --> planner[Planner Node]
+    planner --> agent[Agent Node]
+    agent --> should_continue{should_continue?}
+    
+    should_continue -->|has tool_calls| tools[Tool Node]
+    should_continue -->|no tool_calls| verifier[Verifier Node]
+    
+    tools --> agent
+    
+    verifier --> route{route_after_verify?}
+    
+    route -->|max iterations| END([END])
+    route -->|verification passed| END
+    route -->|failed/error| planner
+    route -->|continue| agent
+    
+    style START fill:#e1f5e1
+    style END fill:#ffe1e1
+    style planner fill:#e3f2fd
+    style agent fill:#fff3e0
+    style tools fill:#f3e5f5
+    style verifier fill:#e8f5e9
+    style should_continue fill:#fff9c4
+    style route fill:#fff9c4
+```
+
+**Nodes:**
+- `planner_node`: Tạo plan hoặc replan khi có error
+- `agent_node`: Gọi LLM với tools dựa trên plan
+- `tool_node`: Execute tools (shell, database) với validation
+- `verifier_node`: Kiểm tra task completion và detect errors
+
+**Routing Logic:**
+- `should_continue`: agent → tools (nếu có tool_calls) hoặc verifier
+- `route_after_verify`: verifier → planner (replan) | agent (continue) | END
+
+**Termination Conditions:**
+- Natural stop: Model không gọi thêm tool và verifier pass
+- Budget stop: Đạt MAX_ITERATIONS (default: 1)
+- Error stop: Verifier detect error và trigger replan
+
+**Tools:**
+- `run_shell_tool`: Shell commands (ls, cat, grep, wc, head, find, pwd)
+- `query_db`: Execute SQL queries
+- `list_tables`: List database tables
+
+**Integration Flow:**
 
 ```
 Cách 1: Qua API
