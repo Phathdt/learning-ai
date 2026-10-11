@@ -10,6 +10,7 @@ from operator import add
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
+from langgraph.types import interrupt
 from langchain_core.messages import HumanMessage, ToolMessage
 
 # Import LLM setup
@@ -38,7 +39,7 @@ class AgentState(TypedDict):
 
     # === Control flow ===
     iteration: int  # Đếm số vòng, dùng cho max_iterations
-    status: Literal["running", "success", "failed", "needs_approval"]
+    status: Literal["running", "success", "failed", "needs_approval", "approved", "rejected"]
 
     # === Verification ===
     verification_passed: bool  # Kết quả verifier
@@ -46,6 +47,10 @@ class AgentState(TypedDict):
 
     # === Retry tracking ===
     retry_count: int  # Số lần retry tool hiện tại
+
+    # === Human approval ===
+    pending_tool_call: dict | None  # Tool call đang chờ approval
+    approval_message: str | None  # Message hiển thị cho human
 
 
 # Configuration
@@ -102,6 +107,49 @@ def agent_node(state: AgentState) -> dict:
     return {"messages": [response], "iteration": iteration + 1, "status": "running"}
 
 
+def approval_check_node(state: AgentState) -> dict:
+    """
+    Node kiểm tra xem tool calls có cần approval không
+    Sử dụng interrupt() để pause graph và chờ human approval
+    """
+    messages = state["messages"]
+    last_message = messages[-1]
+
+    # Check if there are tool calls
+    if not hasattr(last_message, "tool_calls") or not last_message.tool_calls:
+        return {"status": "running"}
+
+    # Check each tool call
+    for tool_call in last_message.tool_calls:
+        tool_name = tool_call['name']
+
+        # Database queries need approval
+        if tool_name in ['query_db', 'list_tables']:
+            print(f"  ⚠ Tool '{tool_name}' requires human approval")
+
+            # Use interrupt() to pause and wait for approval
+            approval = interrupt({
+                "type": "approval_required",
+                "tool": tool_name,
+                "args": tool_call.get('args', {}),
+                "message": f"Approve database query: {tool_name}({tool_call.get('args', {})})?",
+                "tool_call_id": tool_call.get('id')
+            })
+
+            if approval and approval.get("approved"):
+                print(f"  ✓ Tool '{tool_name}' approved - proceeding")
+                return {"status": "running"}
+            else:
+                print(f"  ✗ Tool '{tool_name}' rejected")
+                return {
+                    "status": "failed",
+                    "error_message": approval.get("reason", "Tool execution rejected by admin")
+                }
+
+    # No tools need approval
+    return {"status": "running"}
+
+
 def tool_node(state: AgentState) -> dict:
     """
     Node thực thi tools với retry và exponential backoff
@@ -113,7 +161,8 @@ def tool_node(state: AgentState) -> dict:
     tool_outputs = []
 
     for tool_call in last_message.tool_calls:
-        print(f"  Executing: {tool_call['name']}")
+        tool_name = tool_call['name']
+        print(f"  Executing: {tool_name}")
 
         # Retry logic với exponential backoff
         max_retries = MAX_TOOL_RETRIES
@@ -178,7 +227,8 @@ def tool_node(state: AgentState) -> dict:
         "messages": tool_results,
         "tool_results": tool_outputs,
         "status": "running",
-        "retry_count": 0  # Reset for next tool execution
+        "retry_count": 0,  # Reset for next tool execution
+        "pending_tool_call": None,  # Clear pending approval
     }
 
 
@@ -275,13 +325,20 @@ def create_agent_graph(checkpointer=None):
                       Nếu có checkpointer, graph sẽ persist state vào database
 
     Flow:
-    planner → agent → [tools] → verifier → {planner|agent|END}
+    planner → agent → approval_check → [tools] → agent → verifier → {planner|agent|END}
+
+    Human approval:
+    - approval_check node kiểm tra nếu tool cần approval
+    - Nếu cần, graph interrupt với status="needs_approval"
+    - Admin gọi graph.update_state() với status="approved"
+    - Graph tiếp tục từ approval_check → tools
     """
     workflow = StateGraph(AgentState)
 
     # Add nodes
     workflow.add_node("planner", planner_node)
     workflow.add_node("agent", agent_node)
+    workflow.add_node("approval_check", approval_check_node)
     workflow.add_node("tools", tool_node)
     workflow.add_node("verifier", verifier_node)
 
@@ -291,9 +348,12 @@ def create_agent_graph(checkpointer=None):
 
     # Conditional: agent → tools or verifier
     workflow.add_conditional_edges(
-        "agent", should_continue, {"tools": "tools", "verifier": "verifier"}
+        "agent", should_continue,
+        {"tools": "approval_check", "verifier": "verifier"}  # Go to approval_check first
     )
 
+    # approval_check → tools (always, but might interrupt)
+    workflow.add_edge("approval_check", "tools")
     workflow.add_edge("tools", "agent")
 
     # Conditional: verifier → planner, agent, or END
@@ -303,6 +363,7 @@ def create_agent_graph(checkpointer=None):
         {"planner": "planner", "agent": "agent", "end": END},
     )
 
+    # Compile - interrupt() sẽ tự động pause graph
     return workflow.compile(checkpointer=checkpointer)
 
 
