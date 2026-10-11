@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 
 from langchain_core.messages import HumanMessage, ToolMessage, AIMessage
 from agent import create_agent_graph, extract_text
+from db_setup import get_checkpointer
 
 # Load environment variables
 load_dotenv()
@@ -21,6 +22,7 @@ load_dotenv()
 class AgentRequest(BaseModel):
     """Request model cho agent endpoint"""
     task: str
+    thread_id: Optional[str] = "default"  # Session ID cho checkpointing
     max_turns: Optional[int] = 10
 
 
@@ -77,29 +79,52 @@ async def run_agent_endpoint(request: AgentRequest):
     Chạy agent với task đã cho (blocking)
 
     Args:
-        request: AgentRequest chứa task và config
+        request: AgentRequest chứa task, thread_id và config
 
     Returns:
         AgentResponse với kết quả
     """
     try:
-        # Create agent graph
-        graph = create_agent_graph()
+        # Get checkpointer và create agent graph
+        checkpointer = get_checkpointer()
+        graph = create_agent_graph(checkpointer=checkpointer)
 
-        # Initial state - phải khớp với AgentState
-        initial_state = {
-            "task": request.task,
-            "messages": [HumanMessage(content=request.task)],
-            "tool_results": [],
-            "plan": None,
-            "iteration": 0,
-            "status": "running",
-            "verification_passed": False,
-            "error_message": None
-        }
+        # Config với thread_id
+        config = {"configurable": {"thread_id": request.thread_id}}
 
-        # Run graph
-        final_state = graph.invoke(initial_state)
+        # Check if checkpoint exists
+        try:
+            existing_state = graph.get_state(config)
+            has_checkpoint = bool(existing_state.values)
+        except:
+            has_checkpoint = False
+
+        if has_checkpoint:
+            # Resume từ checkpoint
+            graph.update_state(
+                config,
+                {
+                    "task": request.task,
+                    "messages": [HumanMessage(content=request.task)],
+                    "status": "running",
+                    "verification_passed": False,
+                }
+            )
+            final_state = graph.invoke(None, config=config)
+        else:
+            # New conversation
+            initial_state = {
+                "task": request.task,
+                "messages": [HumanMessage(content=request.task)],
+                "tool_results": [],
+                "plan": None,
+                "iteration": 0,
+                "status": "running",
+                "verification_passed": False,
+                "error_message": None,
+                "retry_count": 0,
+            }
+            final_state = graph.invoke(initial_state, config=config)
 
         # Extract result
         result = extract_text(final_state["messages"][-1])
@@ -120,15 +145,19 @@ async def stream_agent_endpoint(request: AgentRequest):
     Stream agent execution (SSE)
 
     Args:
-        request: AgentRequest chứa task và config
+        request: AgentRequest chứa task, thread_id và config
 
     Returns:
         StreamingResponse với server-sent events
     """
     async def event_generator():
         try:
-            # Create agent graph
-            graph = create_agent_graph()
+            # Get checkpointer và create agent graph
+            checkpointer = get_checkpointer()
+            graph = create_agent_graph(checkpointer=checkpointer)
+
+            # Config với thread_id
+            config = {"configurable": {"thread_id": request.thread_id}}
 
             # Initial state - phải khớp với AgentState
             initial_state = {
@@ -139,14 +168,15 @@ async def stream_agent_endpoint(request: AgentRequest):
                 "iteration": 0,
                 "status": "running",
                 "verification_passed": False,
-                "error_message": None
+                "error_message": None,
+                "retry_count": 0,
             }
 
             # Stream events
-            yield f"data: {{'event': 'start', 'task': '{request.task}'}}\n\n"
+            yield f"data: {{'event': 'start', 'task': '{request.task}', 'thread_id': '{request.thread_id}'}}\n\n"
 
             # Run graph with streaming
-            for chunk in graph.stream(initial_state, stream_mode="updates"):
+            for chunk in graph.stream(initial_state, config=config, stream_mode="updates"):
                 for node_name, node_update in chunk.items():
                     iteration = node_update.get("iteration", 0)
 

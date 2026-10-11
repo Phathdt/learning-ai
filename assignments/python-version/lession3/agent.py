@@ -1,5 +1,5 @@
 """
-LangGraph Agent - Core logic với logging support
+LangGraph Agent - Core logic với logging support và PostgreSQL checkpointing
 """
 
 import json
@@ -17,6 +17,9 @@ from llm_setup import create_llm, get_llm_with_tools
 
 # Import tools
 from tools import run_shell_tool, query_db, list_tables
+
+# Import checkpointer
+from db_setup import get_checkpointer
 
 
 # LangGraph State
@@ -266,6 +269,11 @@ def create_agent_graph(checkpointer=None):
     """
     Tạo LangGraph cho agent loop với planner và verifier
 
+    Args:
+        checkpointer: Optional checkpointer instance (PostgresSaver)
+                      Nếu None, graph sẽ stateless
+                      Nếu có checkpointer, graph sẽ persist state vào database
+
     Flow:
     planner → agent → [tools] → verifier → {planner|agent|END}
     """
@@ -313,36 +321,61 @@ def extract_text(message) -> str:
     return ""
 
 
-def run_agent(task: str, verbose: bool = True) -> str:
+def run_agent(task: str, thread_id: str = "default", verbose: bool = True) -> str:
     """
     Chạy agent với task đã cho
 
     Args:
         task: Nhiệm vụ cho agent
+        thread_id: Session ID để persist conversation (default: "default")
         verbose: Nếu True, in ra logging với jq
 
     Returns:
         Kết quả cuối cùng từ agent
     """
     if verbose:
-        return run_agent_with_logging(task)
+        return run_agent_with_logging(task, thread_id)
 
-    graph = create_agent_graph()
+    # Get checkpointer
+    checkpointer = get_checkpointer()
+    graph = create_agent_graph(checkpointer=checkpointer)
 
-    # Initial state
-    initial_state = {
-        "task": task,
-        "messages": [HumanMessage(content=task)],
-        "tool_results": [],
-        "plan": None,
-        "iteration": 0,
-        "status": "running",
-        "verification_passed": False,
-        "error_message": None,
-        "retry_count": 0,
-    }
+    # Config với thread_id
+    config = {"configurable": {"thread_id": thread_id}}
 
-    final_state = graph.invoke(initial_state)
+    # Check if checkpoint exists
+    try:
+        existing_state = graph.get_state(config)
+        has_checkpoint = bool(existing_state.values)
+    except:
+        has_checkpoint = False
+
+    if has_checkpoint:
+        # Resume từ checkpoint - chỉ cần add new message
+        graph.update_state(
+            config,
+            {
+                "task": task,
+                "messages": [HumanMessage(content=task)],
+                "status": "running",
+                "verification_passed": False,
+            }
+        )
+        final_state = graph.invoke(None, config=config)
+    else:
+        # New conversation - full initial state
+        initial_state = {
+            "task": task,
+            "messages": [HumanMessage(content=task)],
+            "tool_results": [],
+            "plan": None,
+            "iteration": 0,
+            "status": "running",
+            "verification_passed": False,
+            "error_message": None,
+            "retry_count": 0,
+        }
+        final_state = graph.invoke(initial_state, config=config)
 
     # Extract final answer
     return extract_text(final_state["messages"][-1])
@@ -419,30 +452,61 @@ def invoke_llm_with_logging(llm, messages, label: str = "LLM"):
     return response
 
 
-def run_agent_with_logging(task: str) -> str:
+def run_agent_with_logging(task: str, thread_id: str = "default") -> str:
     """
     Chạy agent với logging (nodes tự log qua invoke_llm_with_logging)
-    """
-    graph = create_agent_graph()
 
-    initial_state = {
-        "task": task,
-        "messages": [HumanMessage(content=task)],
-        "tool_results": [],
-        "plan": None,
-        "iteration": 0,
-        "status": "running",
-        "verification_passed": False,
-        "error_message": None,
-        "retry_count": 0,
-    }
+    Args:
+        task: Nhiệm vụ cho agent
+        thread_id: Session ID để persist conversation
+    """
+    # Get checkpointer
+    checkpointer = get_checkpointer()
+    graph = create_agent_graph(checkpointer=checkpointer)
+
+    # Config với thread_id
+    config = {"configurable": {"thread_id": thread_id}}
 
     print(f"\n{'=' * 60}")
     print(f"TASK: {task}")
+    print(f"THREAD_ID: {thread_id}")
     print(f"{'=' * 60}")
 
-    # Invoke graph (nodes sẽ tự log)
-    final_state = graph.invoke(initial_state)
+    # Check if checkpoint exists
+    try:
+        existing_state = graph.get_state(config)
+        has_checkpoint = bool(existing_state.values)
+    except:
+        has_checkpoint = False
+
+    if has_checkpoint:
+        print(f"[INFO] Resuming from existing checkpoint")
+        # Resume từ checkpoint
+        graph.update_state(
+            config,
+            {
+                "task": task,
+                "messages": [HumanMessage(content=task)],
+                "status": "running",
+                "verification_passed": False,
+            }
+        )
+        final_state = graph.invoke(None, config=config)
+    else:
+        print(f"[INFO] Starting new conversation")
+        # New conversation
+        initial_state = {
+            "task": task,
+            "messages": [HumanMessage(content=task)],
+            "tool_results": [],
+            "plan": None,
+            "iteration": 0,
+            "status": "running",
+            "verification_passed": False,
+            "error_message": None,
+            "retry_count": 0,
+        }
+        final_state = graph.invoke(initial_state, config=config)
 
     # Extract final answer
     result = extract_text(final_state["messages"][-1])
